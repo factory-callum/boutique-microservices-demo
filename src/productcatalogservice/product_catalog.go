@@ -79,5 +79,12 @@ func (p *productCatalog) parseCatalog() []*pb.Product {
 		}
 	}
 
+	// Serve catalog prices in EUR while keeping the existing `price_usd` field.
+	for _, product := range p.catalog.Products {
+		if product.PriceUsd != nil {
+			product.PriceUsd.CurrencyCode = "EUR"
+		}
+	}
+
 	return p.catalog.Products
 }
