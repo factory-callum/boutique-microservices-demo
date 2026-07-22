@@ -1,0 +1,23 @@
+.github/workflows/impact-analysis.yml
+  831bde37ee5d6630 1-221
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.2",
+  "base_commit_sha": "ea02e6c67b73dcbe66f5e92924d7119fbf4cd148",
+  "prompts": {
+    "831bde37ee5d6630": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "7dc87a45-a67c-4bb8-aa1c-376c3218926c",
+        "model": "claude-opus-4-8-fast"
+      },
+      "human_author": "Callum Miles",
+      "messages": [],
+      "total_additions": 221,
+      "total_deletions": 0,
+      "accepted_lines": 221,
+      "overriden_lines": 0
+    }
+  }
+}
