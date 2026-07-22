@@ -1,0 +1,221 @@
+name: Impact Analysis
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to analyze'
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  impact-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      REPO_FULL_NAME: ${{ github.repository }}
+    steps:
+      - name: Checkout PR (full tree so the agent can trace dependencies)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Validate secrets
+        run: |
+          set -euo pipefail
+          [ -n "${FACTORY_API_KEY:-}" ] || { echo "::error::FACTORY_API_KEY is missing. Add it under Settings > Secrets and variables > Actions."; exit 1; }
+
+      - name: Install Droid CLI
+        run: |
+          curl --retry 5 --retry-delay 2 --retry-all-errors -fsSL https://app.factory.ai/cli | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/droid" --version
+
+      - name: Gather diff context
+        run: |
+          set -euo pipefail
+          gh pr diff "$PR_NUMBER" --repo "$REPO_FULL_NAME" > "$RUNNER_TEMP/pr-diff.txt"
+          gh api "repos/${REPO_FULL_NAME}/pulls/${PR_NUMBER}/files" --paginate \
+            --jq '.[] | {filename, status, additions, deletions, changes}' \
+            > "$RUNNER_TEMP/pr-files.json"
+
+          if [ ! -s "$RUNNER_TEMP/pr-diff.txt" ]; then
+            echo "::error::PR diff is empty, cannot generate impact analysis"
+            exit 1
+          fi
+
+          echo "Diff size: $(wc -c < "$RUNNER_TEMP/pr-diff.txt") bytes"
+          echo "Files changed: $(wc -l < "$RUNNER_TEMP/pr-files.json") lines"
+
+      - name: Build impact analysis prompt
+        run: |
+          set -euo pipefail
+
+          # Write the prompt template using a quoted heredoc (no shell expansion)
+          cat > "$RUNNER_TEMP/impact-analysis-prompt.txt" << 'PROMPT_EOF'
+          You are generating an IMPACT ANALYSIS for a GitHub pull request. This is a non-interactive CI execution.
+          Do NOT use the AskUser tool. The user is not present and cannot respond.
+          Do NOT edit, create, or delete any files. Do NOT commit or push. You are read-only.
+          You MAY read files, grep, and list directories in the checked-out repository to trace dependencies.
+          Respond with ONLY the impact analysis markdown content, nothing else.
+
+          ## Repository context
+
+          This repository ("Online Boutique") is a microservices monorepo. Each microservice lives in its own
+          subdirectory under `src/<service>/`, and the services communicate over gRPC. The single shared
+          contract is `protos/demo.proto`, which defines every service's RPCs and messages. Kubernetes
+          manifests under `kubernetes-manifests/`, `kustomize/`, and `helm-chart/` wire the services together
+          (env vars like `*_SERVICE_ADDR` declare which services call which).
+
+          Known services (verify against the repo): adservice, cartservice, checkoutservice, currencyservice,
+          emailservice, frontend, paymentservice, productcatalogservice, recommendationservice, shippingservice,
+          shoppingassistantservice, and loadgenerator. The frontend calls most services; checkoutservice
+          orchestrates cart, productcatalog, currency, shipping, payment, and email.
+
+          ## Your task
+
+          The PR modifies files under this monorepo (branch `__HEAD_REF__` vs `__BASE_REF__`). The full diff and
+          the list of changed files are provided at the end of this prompt. Determine the CHANGED service(s) from
+          the file paths, then trace the DOWNSTREAM and UPSTREAM impact across OTHER services.
+
+          Do the tracing by actually exploring the repo:
+          - Read `protos/demo.proto` to see which RPCs/messages the changed service owns or consumes.
+          - If the diff touches `protos/demo.proto`, treat it as a CONTRACT change: every service that implements
+            or calls the affected RPC/message is in the blast radius. Grep the codebase for the affected symbols.
+          - Grep other services' source for gRPC client calls to the changed service (by RPC method name, stub
+            name, or the `*_SERVICE_ADDR` env var) to find callers (upstream) and callees (downstream).
+          - Check the Kubernetes/Helm/Kustomize manifests for service-to-service wiring that is affected.
+
+          ## Output format (GitHub-flavored markdown)
+
+          1. `# Impact Analysis` title, then a line: `Changes in \`__HEAD_REF__\` analyzed against \`__BASE_REF__\``.
+          2. **Summary** (2-4 sentences): which service(s) changed, the nature of the change, and whether the blast
+             radius is contained to one service or crosses service boundaries.
+          3. **Changed service(s)**: bullet list of the directly modified services/components with the key files.
+          4. **Blast radius diagram**: a Mermaid `graph TD` showing the changed service(s) and the other services
+             impacted, with edge labels naming the RPC/contract that links them. Highlight the changed node.
+             Keep it to 5-12 nodes. Example:
+             ```mermaid
+             graph TD
+                 CHANGED[checkoutservice - CHANGED]:::changed --> CART[cartservice]
+                 CHANGED -->|GetProduct| PC[productcatalogservice]
+                 FE[frontend] -->|PlaceOrder| CHANGED
+                 classDef changed fill:#f9a,stroke:#900,stroke-width:2px;
+             ```
+          5. **Downstream / upstream impact table** with columns:
+             `| Affected service | Relationship | Contract / RPC | How it could break | Risk |`
+             Include one row per impacted service. Relationship is `upstream (caller)`, `downstream (callee)`,
+             or `contract (shared proto)`. Risk is one of *Low* / *Medium* / *High* with a short reason.
+             If the change is fully contained to one service with no cross-service surface, say so explicitly
+             in a single row.
+          6. **Recommended verification**: bullet list of the specific services whose tests/builds should run and
+             any integration paths worth exercising, given the blast radius above.
+          7. **Risk callouts**: any breaking-change, backwards-compatibility, or data/PII considerations. Format
+             each as `**[Category]** *[Risk level]*: [description]` (e.g. `**Breaking Change** *High risk*: ...`).
+
+          Be concrete and cite the actual file paths and RPC names you found. Do not invent dependencies that you
+          did not confirm in the repo or the diff.
+          PROMPT_EOF
+
+          # Replace branch name placeholders with actual values
+          sed -i "s|__HEAD_REF__|${HEAD_REF}|g" "$RUNNER_TEMP/impact-analysis-prompt.txt"
+          sed -i "s|__BASE_REF__|${BASE_REF}|g" "$RUNNER_TEMP/impact-analysis-prompt.txt"
+
+          # Append the changed files and diff data
+          {
+            echo ""
+            echo "<changed_files>"
+            cat "$RUNNER_TEMP/pr-files.json"
+            echo "</changed_files>"
+            echo ""
+            echo "<git_diff>"
+            # Truncate diff to ~100KB to stay within token limits
+            head -c 100000 "$RUNNER_TEMP/pr-diff.txt"
+            if [ "$(wc -c < "$RUNNER_TEMP/pr-diff.txt")" -gt 100000 ]; then
+              echo ""
+              echo "... [diff truncated due to size]"
+            fi
+            echo "</git_diff>"
+          } >> "$RUNNER_TEMP/impact-analysis-prompt.txt"
+
+          echo "Prompt size: $(wc -c < "$RUNNER_TEMP/impact-analysis-prompt.txt") bytes"
+
+      - name: Generate impact analysis via droid exec
+        id: generate
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+
+          # Default (no --auto) runs read-only: the agent can read/grep/list to trace
+          # dependencies but cannot modify the repo. Only the final markdown hits stdout.
+          "$HOME/.local/bin/droid" exec -f "$RUNNER_TEMP/impact-analysis-prompt.txt" \
+            | tee "$RUNNER_TEMP/impact-analysis-output.md"
+
+          if [ ! -s "$RUNNER_TEMP/impact-analysis-output.md" ]; then
+            echo "::warning::Impact analysis generation produced empty output"
+            echo "generated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "generated=true" >> "$GITHUB_OUTPUT"
+            echo "Output size: $(wc -c < "$RUNNER_TEMP/impact-analysis-output.md") bytes"
+          fi
+
+      - name: Sanitize output for GitHub markdown
+        if: steps.generate.outputs.generated == 'true'
+        run: |
+          set -euo pipefail
+          # Strip terminal control characters that can leak from CLI stdout
+          # (preserve tab \x09, newline \x0a, carriage return \x0d).
+          perl -i -pe 's/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]//g' \
+            "$RUNNER_TEMP/impact-analysis-output.md"
+
+      - name: Append impact analysis to PR description
+        if: steps.generate.outputs.generated == 'true'
+        run: |
+          set -euo pipefail
+
+          # Fetch current PR body to a file (avoids shell expansion issues)
+          gh pr view "$PR_NUMBER" --repo "$REPO_FULL_NAME" --json body --jq '.body // ""' \
+            > "$RUNNER_TEMP/current-body.txt"
+
+          # Strip existing impact analysis section if present (idempotent replace)
+          perl -0777 -i -pe \
+            's/(\n*---\n*\n*)?<!-- FACTORY_IMPACT_ANALYSIS_START -->.*?<!-- FACTORY_IMPACT_ANALYSIS_END -->\n?//s' \
+            "$RUNNER_TEMP/current-body.txt"
+
+          # Strip trailing whitespace/newlines
+          sed -i -e 's/[[:space:]]*$//' "$RUNNER_TEMP/current-body.txt"
+
+          # Build the new PR body file
+          {
+            cat "$RUNNER_TEMP/current-body.txt"
+            if [ -s "$RUNNER_TEMP/current-body.txt" ]; then
+              printf '\n\n---\n\n'
+            fi
+            echo '<!-- FACTORY_IMPACT_ANALYSIS_START -->'
+            echo '<details>'
+            echo '<summary>Impact Analysis</summary>'
+            echo ''
+            cat "$RUNNER_TEMP/impact-analysis-output.md"
+            echo ''
+            echo '</details>'
+            echo '<!-- FACTORY_IMPACT_ANALYSIS_END -->'
+          } > "$RUNNER_TEMP/new-pr-body.txt"
+
+          # Update the PR description using --body-file to avoid shell quoting issues
+          gh pr edit "$PR_NUMBER" --repo "$REPO_FULL_NAME" \
+            --body-file "$RUNNER_TEMP/new-pr-body.txt"
+          echo "Impact analysis appended to PR #${PR_NUMBER} description"
