@@ -33,6 +33,11 @@ namespace cartservice.services
 
         public async override Task<Empty> AddItem(AddItemRequest request, ServerCallContext context)
         {
+            if (request.Item.Quantity <= 0)
+            {
+                throw new RpcException(new Status(StatusCode.InvalidArgument, "Item quantity must be greater than zero"));
+            }
+
             await _cartStore.AddItemAsync(request.UserId, request.Item.ProductId, request.Item.Quantity);
             return Empty;
         }
