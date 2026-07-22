@@ -106,14 +106,31 @@ jobs:
           2. **Summary** (2-4 sentences): which service(s) changed, the nature of the change, and whether the blast
              radius is contained to one service or crosses service boundaries.
           3. **Changed service(s)**: bullet list of the directly modified services/components with the key files.
-          4. **Blast radius diagram**: a Mermaid `graph TD` showing the changed service(s) and the other services
-             impacted, with edge labels naming the RPC/contract that links them. Highlight the changed node.
-             Keep it to 5-12 nodes. Example:
+          4. **Blast radius diagram**: a Mermaid `graph TD` showing the changed service(s) and the other
+             services impacted, with edge labels naming the RPC/contract that links them. Highlight the
+             changed node with a `classDef`. Keep it to 5-12 nodes.
+
+             CRITICAL Mermaid rules so it renders on GitHub (a syntax slip leaves a broken diagram):
+             - Wrap EVERY node label and EVERY edge label in double quotes.
+             - Do NOT put any of these characters inside a label: < > ( ) [ ] { } / : ; # & |
+               Write comparisons in words (e.g. "quantity <= 0" becomes "quantity zero or less") and
+               write "A / B" as "A or B".
+             - Use only simple rectangle nodes of the form `ID["label"]`. Do NOT use cylinder `[( )]`,
+               rounded `( )`, or any other special node shape.
+             - Node IDs must be short alphanumeric tokens with no spaces or punctuation.
+             - Put the `class` line and the `classDef` line each on their own line.
+
+             Follow this shape exactly:
              ```mermaid
              graph TD
-                 CHANGED[checkoutservice - CHANGED]:::changed --> CART[cartservice]
-                 CHANGED -->|GetProduct| PC[productcatalogservice]
-                 FE[frontend] -->|PlaceOrder| CHANGED
+                 CHANGED["checkoutservice - changed"]
+                 CART["cartservice"]
+                 PC["productcatalogservice"]
+                 FE["frontend"]
+                 CHANGED -->|"GetCart"| CART
+                 CHANGED -->|"GetProduct"| PC
+                 FE -->|"PlaceOrder"| CHANGED
+                 class CHANGED changed
                  classDef changed fill:#f9a,stroke:#900,stroke-width:2px;
              ```
           5. **Downstream / upstream impact table** with columns:
@@ -205,13 +222,13 @@ jobs:
             if [ -s "$RUNNER_TEMP/current-body.txt" ]; then
               printf '\n\n---\n\n'
             fi
+            # Render inline (no collapsed <details>): GitHub renders Mermaid at page
+            # load, and a diagram inside a collapsed <details> has zero width and
+            # gets stuck on the loading spinner. Inline rendering avoids that.
             echo '<!-- FACTORY_IMPACT_ANALYSIS_START -->'
-            echo '<details>'
-            echo '<summary>Impact Analysis</summary>'
             echo ''
             cat "$RUNNER_TEMP/impact-analysis-output.md"
             echo ''
-            echo '</details>'
             echo '<!-- FACTORY_IMPACT_ANALYSIS_END -->'
           } > "$RUNNER_TEMP/new-pr-body.txt"
 
